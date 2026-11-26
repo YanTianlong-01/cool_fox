@@ -52,7 +52,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        let staging_limit = if crate::residency::critical_commit()
+            || shared_full(memory.map(|[_, _, budget, used]| (budget, used)), crate::draw::shared_stage_percent())
+        {
             0
         } else if pressure {
             1
@@ -61,6 +63,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+}
+
+/// Whether the PC's memory shared with the card (budget, use) is at or over
+/// `percent` of its budget (`VICTORY_SHARED_STAGE_PERCENT`): staging blocks
+/// are that memory, and on an RTX 4070 with 16 GB of RAM it ran out (a list
+/// could not be closed, E_OUTOFMEMORY) while the residency guard, which
+/// watches the PC's commit, saw no pressure. No empty staging block stays
+/// then (as victory-cgbj's port of this fork's own release of spares).
+fn shared_full(shared: Option<(u64, u64)>, percent: Option<u64>) -> bool {
+    matches!((shared, percent), (Some((budget, used)), Some(pct)) if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * u128::from(pct))
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -595,6 +607,17 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn shared_memory_is_full_at_its_line() {
+        // A budget whose percentages are exact.
+        let budget: u64 = 7_000_000_000;
+        assert!(!shared_full(None, Some(75)));
+        assert!(!shared_full(Some((budget, budget)), None));
+        assert!(!shared_full(Some((budget, budget * 74 / 100)), Some(75)));
+        assert!(shared_full(Some((budget, budget * 75 / 100)), Some(75)));
+        assert!(!shared_full(Some((0, 5)), Some(75)));
     }
 
     #[test]
