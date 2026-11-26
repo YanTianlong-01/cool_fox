@@ -160,6 +160,71 @@ thread_local! {
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_SHARED_STAGE_PERCENT=<n>` (10 to 100): textures are staged only
+/// (ported from victory-cgbj a2a03d8 and its room-based follow-up; here for the
+/// passes that are not required, as the residency ceiling)
+/// while the PC's memory shared with the card is under n % of its budget.
+/// Unset: staged by the frame's budget alone, as before.
+///
+/// Staging buffers are that memory, and its budget is half of the PC's RAM,
+/// whatever the card has: the per-frame budget is scaled from the card's
+/// memory (`staging_budget_per_frame`, 576 MB a frame with the catch-up on a
+/// 12 GB card), and a staging piece goes back only once its list has run,
+/// two seconds later (`crate::pool`). On an RTX 4070 with 16 GB of RAM the
+/// shared use climbed from 1.2 GB to 7.37 GB of a 7.45 GB budget in 40 s of
+/// a world loading, and the device was removed while textures were made
+/// ready. With the cap the pass stops for the frame and goes on when earlier
+/// staging has gone back.
+pub(crate) fn shared_stage_percent() -> Option<u64> {
+    static PCT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_SHARED_STAGE_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|p| p.clamp(10, 100))
+    })
+}
+
+/// The bytes the pass may take the frame to: `at_most`, but no further than
+/// the room left under `percent` of the shared budget (`shared`: budget,
+/// use) on top of what the frame has `spent`, and nothing more once the use
+/// is at or over it.
+///
+/// (A frame first got its whole budget whenever the use was under the line:
+/// at a world's loading, a frame or two a second, each frame took the use
+/// some 0.6-1 GB past the last look, and with ray tracing on the shared use
+/// went from 6.8 to 7.45 GB of a 7.45 GB budget in one such step.)
+fn shared_stage_room(spent: u64, at_most: u64, shared: Option<(u64, u64)>, percent: Option<u64>) -> u64 {
+    match (shared, percent) {
+        (Some((budget, used)), Some(pct)) if budget > 0 => {
+            let line = (u128::from(budget) * u128::from(pct) / 100) as u64;
+            at_most.min(spent.saturating_add(line.saturating_sub(used)))
+        }
+        _ => at_most,
+    }
+}
+
+#[cfg(test)]
+mod shared_stage_tests {
+    use super::shared_stage_room;
+
+    /// With room (or with no cap or no figures) the frame's budget stands; close
+    /// to the line only the room left is staged; at or over it nothing more.
+    #[test]
+    fn staging_stops_when_shared_memory_is_nearly_used() {
+        // A budget whose percentages are exact (no rounding in the test).
+        let budget: u64 = 7_000_000_000;
+        let line = budget * 80 / 100;
+        assert_eq!(shared_stage_room(100, 900, None, Some(80)), 900);
+        assert_eq!(shared_stage_room(100, 900, Some((budget, budget)), None), 900);
+        assert_eq!(shared_stage_room(100, 900, Some((budget, budget * 79 / 100)), Some(80)), 900);
+        // 500 bytes of room left: the frame stops 500 bytes on from where it is.
+        assert_eq!(shared_stage_room(100, 900, Some((budget, line - 500)), Some(80)), 600);
+        assert_eq!(shared_stage_room(100, 900, Some((budget, line)), Some(80)), 100);
+        assert_eq!(shared_stage_room(100, 900, Some((budget, budget)), Some(80)), 100);
+        assert_eq!(shared_stage_room(1000, 900, Some((budget, budget)), Some(80)), 900);
+        assert_eq!(shared_stage_room(100, 900, Some((0, 5)), Some(80)), 900);
+    }
+}
+
+
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
 /// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
@@ -2654,6 +2719,18 @@ impl State {
                 crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
                 crate::texture::live_staging_bytes(),
+            )
+        };
+        // Background staging only into the room left under the shared GPU memory line
+        // (`VICTORY_SHARED_STAGE_PERCENT`); bakes keep theirs, as above.
+        let bytes_at_most = if required {
+            bytes_at_most
+        } else {
+            shared_stage_room(
+                SPENT.load(Ordering::Relaxed),
+                bytes_at_most,
+                memory.map(|[_, _, budget, used]| (budget, used)),
+                shared_stage_percent(),
             )
         };
 
